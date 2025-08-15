@@ -1,0 +1,980 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Task Assignment with OR-Tools — Full Diagnostic Version
+-------------------------------------------------------
+- Полная валидация входных данных (с точными ссылками на лист/столбец/строку/значение)
+- Пошаговая диагностика причин, почему переменные x[e,t] не создались
+- Отчёт о задачах без кандидатов
+- Диагностика ограничений multi_task и stay_in_the_lineup
+- Диагностика неназначенных задач после решения
+- Сохранение полной диагностики на лист 'diagnostics' в выходном Excel
+"""
+import os
+import sys
+import time
+import logging
+from typing import Dict, List, Tuple, Optional, Union
+
+import numpy as np
+import pandas as pd
+
+def save_pre_solution_diagnostics(filename="pre_solution_diagnostics.xlsx"):
+    try:
+        pd.DataFrame(DIAGNOSTICS).to_excel(filename, index=False)
+        logger.info(f"[PRE-SOLUTION] Диагностика сохранена в {filename}")
+    except Exception as e:
+        logger.error(f"[PRE-SOLUTION] Ошибка сохранения диагностики: {e}")
+
+from ortools.sat.python import cp_model
+from tqdm import tqdm
+
+# ============================================================
+# Глобальная конфигурация логов
+# ============================================================
+LOG_FILE = 'task_assignment.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode='w', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Глобальный сборщик диагностики (для выгрузки в Excel)
+# ============================================================
+DIAGNOSTICS: List[Dict[str, Union[str, int, float]]] = []
+
+
+def add_diag(stage: str,
+             dtype: str,
+             employee: Optional[str] = None,
+             task_idx: Optional[int] = None,
+             locationcode: Optional[str] = None,
+             reason: Optional[str] = None,
+             extra: Optional[Dict[str, Union[str, int, float]]] = None):
+    """Добавить строку в общий журнал диагностики и продублировать в лог."""
+    row = {
+        'stage': stage,
+        'type': dtype,
+        'employee': employee or '',
+        'task_idx': int(task_idx) if task_idx is not None else '',
+        'locationcode': locationcode or '',
+        'reason': reason or ''
+    }
+    if extra:
+        for k, v in extra.items():
+            row[str(k)] = v
+    DIAGNOSTICS.append(row)
+    # Короткая запись в лог
+    logger.info(f"[{stage.upper()}][{dtype}] emp={row['employee']} task={row['task_idx']} "
+                f"loc={row['locationcode']} -> {row['reason']}")
+
+
+# ============================================================
+# ВАЛИДАЦИЯ ДАННЫХ
+# ============================================================
+class DataValidator:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.required_sheets = ['matrix', 'task']
+        self.matrix_columns = {
+            'login': 'str',
+            'post': 'str',
+            'mezzanine1': 'float',
+            'mezzanine2-4': 'float',
+            'frontal': 'float',
+            'pallet': 'float',
+            'refile': 'float',
+            'priority_1': 'float',
+            'priority_2': 'float',
+            'priority_3': 'float',
+            'priority_4': 'float',
+            'priority_5': 'float',
+            'priority_6': 'float',
+            'priority_7': 'float',
+            'priority_8': 'float',
+            'priority_9': 'float',
+            'personal_effectiveness': 'float',
+            'work_time': 'float',
+            'stay_in_the_lineup': 'bool',
+            'max_load': 'bool',
+            'multi_task': 'bool'
+        }
+        self.task_columns = {
+            'priority': 'str',
+            'time': 'int',
+            'locationcode': 'str',
+            'login': 'str'
+        }
+        self.valid_shelves = ['mezzanine1', 'mezzanine2-4', 'frontal', 'pallet', 'refile']
+        self.valid_priorities = [f'priority_{i}' for i in range(1, 10)]
+        self.empty_values = {'', 'nan', 'na', 'none', 'null', np.nan, None}
+
+    def validate_file(self) -> bool:
+        logger.info('[TRACE] validate_file — старт')
+        """Основная функция проверки файла c детальной диагностикой."""
+        try:
+            self._check_file_and_sheets()
+
+            matrix_df = pd.read_excel(
+                self.file_path,
+                sheet_name='matrix',
+                na_values=['', 'NAN', 'NA', 'None', 'none', 'null', 'NULL']
+            )
+            task_df = pd.read_excel(
+                self.file_path,
+                sheet_name='task',
+                na_values=['', 'NAN', 'NA', 'None', 'none', 'null', 'NULL']
+            )
+
+            matrix_df = self._clean_data(matrix_df)
+            task_df = self._clean_data(task_df)
+
+            self._check_columns(matrix_df, 'matrix', self.matrix_columns)
+            self._check_columns(task_df, 'task', self.task_columns)
+
+            self._validate_data_types(matrix_df, 'matrix', self.matrix_columns)
+            self._validate_data_types(task_df, 'task', self.task_columns)
+
+            self._check_duplicate_logins(matrix_df)
+            self._check_float_columns(matrix_df, 'matrix')
+            self._check_boolean_columns(matrix_df, 'matrix')
+            self._check_task_priorities(task_df)
+            self._check_location_codes(task_df)
+
+            logger.info("Все проверки пройдены успешно. Данные готовы к обработке.")
+            add_diag('validation', 'ok', reason='Все проверки пройдены успешно')
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка при проверке данных: {str(e)}", exc_info=True)
+            add_diag('validation', 'error', reason=str(e))
+            return False
+
+    def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.dropna(how='all')
+        for col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: np.nan if isinstance(x, str) and x.strip().lower() in self.empty_values else x
+            )
+        return df
+
+    def _check_file_and_sheets(self):
+        try:
+            excel_file = pd.ExcelFile(self.file_path)
+            existing_sheets = excel_file.sheet_names
+            for sheet in self.required_sheets:
+                if sheet not in existing_sheets:
+                    raise ValueError(f"Лист '{sheet}' отсутствует. Доступные листы: {existing_sheets}")
+            logger.info("Проверка файла и листов: OK")
+        except Exception as e:
+            add_diag('validation', 'sheet_error', reason=str(e))
+            raise ValueError(f"Ошибка при открытии файла или проверке листов: {str(e)}")
+
+    def _check_columns(self, df: pd.DataFrame, sheet_name: str, expected_columns: Dict[str, str]):
+        missing_columns = set(expected_columns.keys()) - set(df.columns)
+        if missing_columns:
+            msg = (f"Лист '{sheet_name}' — отсутствуют столбцы: {missing_columns}. "
+                   f"Есть столбцы: {list(df.columns)}")
+            add_diag('validation', 'missing_columns', reason=msg)
+            raise ValueError(msg)
+        extra_columns = set(df.columns) - set(expected_columns.keys())
+        if extra_columns:
+            logger.warning(f"Лист '{sheet_name}' — лишние столбцы: {extra_columns}. Они будут проигнорированы.")
+            add_diag('validation', 'extra_columns', reason=f"{extra_columns}")
+        logger.info(f"Проверка столбцов в листе '{sheet_name}': OK")
+
+    def _validate_data_types(self, df: pd.DataFrame, sheet_name: str, expected_types: Dict[str, str]):
+        errors = []
+        for column, expected_type in expected_types.items():
+            if column not in df.columns:
+                continue
+            for idx, value in df[column].items():
+                if self._is_empty(value):
+                    continue
+                try:
+                    if expected_type == 'str':
+                        str_value = str(value).strip()
+                        if not str_value and column != 'login':
+                            msg = f"{sheet_name}!{column}[{idx+2}]: пустая строка после приведения"
+                            errors.append(msg)
+                            add_diag('validation', 'type_error', task_idx=idx, reason=msg,
+                                     extra={'sheet': sheet_name, 'column': column, 'value': str(value)})
+                    elif expected_type == 'float':
+                        float(str(value).replace(',', '.'))
+                    elif expected_type == 'int':
+                        int(float(str(value).replace(',', '.')))
+                    elif expected_type == 'bool':
+                        if str(value).strip().lower() not in ['true', 'false', '1', '0']:
+                            raise ValueError(f"Недопустимое boolean '{value}'")
+                except Exception as e:
+                    msg = (f"{sheet_name}!{column}[{idx+2}]: ожидался {expected_type}, "
+                           f"значение '{value}'. Ошибка: {str(e)}")
+                    errors.append(msg)
+                    add_diag('validation', 'type_error', task_idx=idx, reason=msg,
+                             extra={'sheet': sheet_name, 'column': column, 'value': str(value)})
+        if errors:
+            for er in errors:
+                logger.error(er)
+            raise ValueError(f"Ошибки типов в листе '{sheet_name}' — см. лог")
+
+        logger.info(f"Проверка типов данных в листе '{sheet_name}': OK")
+
+    def _is_empty(self, value) -> bool:
+        if pd.isna(value):
+            return True
+        if isinstance(value, str) and value.strip().lower() in self.empty_values:
+            return True
+        return False
+
+    def _check_duplicate_logins(self, df: pd.DataFrame):
+        logins = df['login'].dropna()
+        duplicates = logins[logins.duplicated(keep=False)]
+        if not duplicates.empty:
+            dup_list = duplicates.unique().tolist()
+            msg = f"Дубликаты 'login': {dup_list}"
+            add_diag('validation', 'duplicate_login', reason=msg)
+            raise ValueError(f"Найдены дубликаты в 'login': {dup_list}")
+        logger.info("Проверка дубликатов логинов: OK")
+
+    def _check_float_columns(self, df: pd.DataFrame, sheet_name: str):
+        float_columns = [col for col, dtype in self.matrix_columns.items() if dtype == 'float']
+        for column in float_columns:
+            if column not in df.columns:
+                continue
+            for idx, value in df[column].items():
+                if self._is_empty(value):
+                    continue
+                try:
+                    float_val = float(str(value).replace(',', '.'))
+                    if float_val < 0:
+                        logger.warning(f"{sheet_name}!{column}[{idx+2}] отрицательное значение '{value}'")
+                        add_diag('validation', 'float_warning', task_idx=idx,
+                                 reason=f"Отрицательное значение {sheet_name}!{column}[{idx+2}]='{value}'",
+                                 extra={'sheet': sheet_name, 'column': column, 'value': str(value)})
+                except Exception as e:
+                    msg = (f"{sheet_name}!{column}[{idx+2}]: невозможно преобразовать в float '{value}'. "
+                           f"Ошибка: {str(e)}")
+                    add_diag('validation', 'float_error', task_idx=idx, reason=msg,
+                             extra={'sheet': sheet_name, 'column': column, 'value': str(value)})
+                    raise ValueError(msg)
+        logger.info(f"Доп. проверка float столбцов в листе '{sheet_name}': OK")
+
+    def _check_boolean_columns(self, df: pd.DataFrame, sheet_name: str):
+        bool_columns = [col for col, dtype in self.matrix_columns.items() if dtype == 'bool']
+        for column in bool_columns:
+            if column not in df.columns:
+                continue
+            for idx, value in df[column].items():
+                if self._is_empty(value):
+                    continue
+                str_val = str(value).strip().lower()
+                if str_val not in ['true', 'false', '1', '0']:
+                    msg = (f"{sheet_name}!{column}[{idx+2}]: Недопустимое boolean '{value}'. "
+                           "Допустимо: true, false, 1, 0")
+                    add_diag('validation', 'bool_error', task_idx=idx, reason=msg,
+                             extra={'sheet': sheet_name, 'column': column, 'value': str(value)})
+                    raise ValueError(msg)
+        logger.info(f"Доп. проверка boolean столбцов в листе '{sheet_name}': OK")
+
+    def _check_task_priorities(self, df: pd.DataFrame):
+        errors = []
+        for idx, value in df['priority'].items():
+            if self._is_empty(value):
+                msg = f"task!priority[{idx+2}]: пустое значение"
+                errors.append(msg)
+                add_diag('validation', 'priority_error', task_idx=idx, reason=msg, extra={'value': str(value)})
+                continue
+            if str(value).strip() not in self.valid_priorities:
+                msg = (f"task!priority[{idx+2}]: недопустимое '{value}'. "
+                       f"Допустимые: {self.valid_priorities}")
+                errors.append(msg)
+                add_diag('validation', 'priority_error', task_idx=idx, reason=msg, extra={'value': str(value)})
+        if errors:
+            for e in errors:
+                logger.error(e)
+            raise ValueError("Ошибки в столбце 'priority' листа 'task'")
+        logger.info("Проверка допустимых значений в 'priority': OK")
+
+    def _check_location_codes(self, df: pd.DataFrame):
+        errors = []
+        for idx, value in df['locationcode'].items():
+            if self._is_empty(value):
+                msg = f"task!locationcode[{idx+2}]: пустое значение"
+                errors.append(msg)
+                add_diag('validation', 'location_error', task_idx=idx, reason=msg, extra={'value': str(value)})
+                continue
+            loc_code = str(value).strip()
+            if not self._is_valid_location_code(loc_code):
+                msg = f"task!locationcode[{idx+2}]: недопустимый формат '{loc_code}'"
+                errors.append(msg)
+                add_diag('validation', 'location_error', task_idx=idx, reason=msg, extra={'value': str(value)})
+        if errors:
+            for e in errors:
+                logger.error(e)
+            raise ValueError("Ошибки в столбце 'locationcode' листа 'task'")
+        logger.info("Проверка формата 'locationcode': OK")
+
+    def _is_valid_location_code(self, loc_code: str) -> bool:
+        if loc_code.startswith('RE') and '-' in loc_code and len(loc_code.split('-')) == 4:
+            parts = loc_code.split('-')
+            if len(parts[0]) == 5 and parts[0][2:].isdigit():
+                line = int(parts[0][2:])
+                if (110 <= line <= 118) or (210 <= line <= 218) or \
+                   (310 <= line <= 318) or (416 <= line <= 418):
+                    return True
+        if loc_code.startswith('RE') and '-' in loc_code and len(loc_code.split('-')) == 4:
+            parts = loc_code.split('-')
+            if len(parts[0]) == 5 and parts[0][2:].isdigit():
+                if int(parts[0][2:]) in [119, 120, 121]:
+                    return True
+        if 'PLT' in loc_code:
+            return True
+        if any(x in loc_code for x in ['REFILE', 'SOD', 'RFL']):
+            return True
+        return False
+
+
+# ============================================================
+# ПРЕОБРАЗОВАНИЕ/ПОДГОТОВКА ДАННЫХ
+# ============================================================
+class DataPreprocessor:
+    @staticmethod
+    def clean_matrix_data(df: pd.DataFrame) -> pd.DataFrame:
+        logger.info(f"Начало очистки matrix. Исходный размер: {df.shape}")
+        df_cleaned = df.dropna(how='all')
+        df_cleaned = df_cleaned.dropna()
+        invalid_values = ['NAN', 'NA', 'NONE', 'nan', 'NaN', '', 'Null', 'NULL']
+        for col in df_cleaned.columns:
+            before = len(df_cleaned)
+            df_cleaned = df_cleaned[~df_cleaned[col].astype(str).str.strip().str.upper().isin(invalid_values)]
+            after = len(df_cleaned)
+            if before != after:
+                logger.info(f"Удалено {before - after} строк по столбцу {col} (matrix)")
+        logger.info(f"Окончательный размер matrix: {df_cleaned.shape}")
+        return df_cleaned.reset_index(drop=True)
+
+    @staticmethod
+    def clean_task_data(df: pd.DataFrame) -> pd.DataFrame:
+        logger.info(f"Начало очистки task. Исходный размер: {df.shape}")
+        df_cleaned = df.dropna(how='all')
+        required_cols = ['priority', 'time', 'locationcode']
+        for col in required_cols:
+            if col in df_cleaned.columns:
+                df_cleaned = df_cleaned[~df_cleaned[col].isna()]
+                df_cleaned = df_cleaned[df_cleaned[col].astype(str).str.strip() != '']
+        invalid_values = ['NAN', 'NA', 'NONE', 'nan', 'NaN', '', 'Null', 'NULL']
+        for col in required_cols:
+            if col in df_cleaned.columns:
+                before = len(df_cleaned)
+                df_cleaned = df_cleaned[~df_cleaned[col].astype(str).str.strip().str.upper().isin(invalid_values)]
+                after = len(df_cleaned)
+                if before != after:
+                    logger.info(f"Удалено {before - after} строк по столбцу {col} (task)")
+        logger.info(f"Окончательный размер task: {df_cleaned.shape}")
+        return df_cleaned.reset_index(drop=True)
+
+    @staticmethod
+    def convert_to_float(value: Union[str, float, int]) -> float:
+        try:
+            if isinstance(value, (float, int)):
+                return float(value)
+            if isinstance(value, str):
+                value = value.replace(',', '.').strip()
+                return float(value)
+        except Exception as e:
+            logger.warning(f"Ошибка конвертации '{value}' в float: {str(e)}")
+        return 0.0
+
+    @staticmethod
+    def classify_location(location: str) -> str:
+        if not isinstance(location, str):
+            return 'unknown'
+        location = location.upper()
+        if 'PLT' in location:
+            return 'pallet'
+        if any(x in location for x in ['REFILE', 'SOD', 'RFL']):
+            return 'refile'
+        if location.startswith('RE'):
+            parts = location.split('-')
+            if len(parts) >= 4:
+                line = parts[0][2:]
+                if line.isdigit():
+                    line_num = int(line)
+                    if 110 <= line_num <= 118 or 210 <= line_num <= 218 or 310 <= line_num <= 318 or 416 <= line_num <= 418:
+                        floor = parts[2]
+                        if floor.isdigit() and 1 <= int(floor) <= 4:
+                            return 'mezzanine1' if line_num % 100 == 10 else 'mezzanine2-4'
+                    if line_num in [119, 120, 121]:
+                        floor = parts[2]
+                        if floor.isdigit() and 1 <= int(floor) <= 11:
+                            return 'frontal'
+        return 'unknown'
+
+
+# ============================================================
+# МОДЕЛЬ ДАННЫХ
+# ============================================================
+class Employee:
+    def __init__(self, data: pd.Series):
+        self.login = str(data['login']).strip()
+        self.post = str(data['post']).strip()
+        self.scores = {
+            'mezzanine1': DataPreprocessor.convert_to_float(data['mezzanine1']),
+            'mezzanine2-4': DataPreprocessor.convert_to_float(data['mezzanine2-4']),
+            'frontal': DataPreprocessor.convert_to_float(data['frontal']),
+            'pallet': DataPreprocessor.convert_to_float(data['pallet']),
+            'refile': DataPreprocessor.convert_to_float(data['refile']),
+        }
+        self.priorities = {f'priority_{i}': DataPreprocessor.convert_to_float(data[f'priority_{i}']) for i in range(1, 10)}
+        self.personal_effectiveness = DataPreprocessor.convert_to_float(data['personal_effectiveness'])
+        self.original_work_time = DataPreprocessor.convert_to_float(data['work_time'])
+        eff_mult = self.personal_effectiveness / 100.0 if self.personal_effectiveness > 0 else 1.0
+        self.work_time = self.original_work_time * eff_mult
+        self.stay_in_the_lineup = str(data['stay_in_the_lineup']).strip().lower() == 'true'
+        self.max_load = str(data['max_load']).strip().lower() == 'true'
+        self.multi_task = str(data['multi_task']).strip().lower() == 'true'
+
+        self.current_line: Optional[str] = None
+        self.assigned_tasks: List[str] = []
+        self.used_time: int = 0
+
+    def get_score(self, task_type: str, priority: str) -> float:
+        task_score = self.scores.get(task_type, 0.0)
+        priority_score = self.priorities.get(priority, 0.0)
+        return 1.0 * task_score * priority_score
+
+    def can_assign_task(self, task_time: int, task_location: str) -> Tuple[bool, str, Dict[str, Union[str, float, int]]]:
+        """Проверка возможности назначения с деталями причины."""
+        limit = self.work_time * (1.05 if self.max_load else 1.0)
+        ok = float(task_time) <= float(limit) + 1e-6
+        if not ok:
+            return False, f"Время задачи {task_time} > лимита {limit:.1f} (max_load={self.max_load})", \
+                {'task_time': task_time, 'limit': round(float(limit), 3)}
+        return True, 'OK', {'task_time': task_time, 'limit': round(float(limit), 3)}
+
+    def assign_task(self, task_time: int, task_location: str):
+        self.used_time += int(task_time)
+        if self.stay_in_the_lineup and self.current_line is None:
+            self.current_line = task_location.split('-')[0]
+        self.assigned_tasks.append(task_location)
+
+
+class Task:
+    def __init__(self, idx: int, data: pd.Series):
+        self.idx = idx
+        self.priority = str(data['priority']).strip()
+        self.time = int(round(float(str(data['time']).replace(',', '.'))))
+        self.locationcode = str(data['locationcode']).strip()
+        self.shelf = DataPreprocessor.classify_location(self.locationcode)  # определяем автоматически
+        self.assigned_to: Optional[str] = None
+
+
+# ============================================================
+# ОПТИМИЗАТОР
+# ============================================================
+class TaskAssigner:
+    def __init__(self, matrix_file: str = 'input_matrix.xlsx'):
+        logger.info(f"Инициализация TaskAssigner с файлом {matrix_file}")
+        self.matrix_file = matrix_file
+        self.employees: List[Employee] = []
+        self.tasks: List[Task] = []
+        self.task_groups: Dict[Tuple[str, str], List[Task]] = {}
+        self.model: Optional[cp_model.CpModel] = None
+        self.solver = cp_model.CpSolver()
+        self.assignment: Dict[int, str] = {}
+        self.total_score: float = 0.0
+        self.x: Dict[Tuple[int, int], cp_model.IntVar] = {}
+        self.y_line: Dict[Tuple[int, str], cp_model.IntVar] = {}
+
+        self.load_and_prepare_data()
+        self.group_tasks()
+
+    def load_and_prepare_data(self):
+        logger.info('[TRACE] load_and_prepare_data — старт')
+        try:
+            logger.info("Начало загрузки данных из Excel")
+            matrix_df = pd.read_excel(self.matrix_file, sheet_name='matrix', engine='openpyxl')
+            task_df = pd.read_excel(self.matrix_file, sheet_name='task', engine='openpyxl')
+            logger.info(f"Файл прочитан. Сотрудников: {len(matrix_df)}, задач: {len(task_df)}")
+            add_diag('load', 'read_ok', reason=f"matrix={len(matrix_df)}, task={len(task_df)}")
+        except Exception as e:
+            add_diag('load', 'read_error', reason=str(e))
+            logger.error(f"Ошибка чтения файла Excel: {str(e)}", exc_info=True)
+            raise
+
+        logger.info("Очистка данных сотрудников (matrix)")
+        matrix_df = DataPreprocessor.clean_matrix_data(matrix_df)
+        logger.info("Очистка данных задач (task)")
+        task_df = DataPreprocessor.clean_task_data(task_df)
+
+        if matrix_df['login'].duplicated().any():
+            duplicates = matrix_df[matrix_df['login'].duplicated(keep=False)]['login'].unique()
+            logger.warning(f"Найдены дубликаты логинов: {duplicates}")
+            add_diag('load', 'duplicate_login', reason=f"{list(duplicates)}")
+            matrix_df = matrix_df.drop_duplicates(subset=['login'], keep='first')
+            logger.info(f"После удаления дубликатов осталось {len(matrix_df)} сотрудников")
+
+        logger.info("Создание объектов Employee")
+        self.employees = [Employee(row) for _, row in tqdm(matrix_df.iterrows(), total=len(matrix_df), desc="Создание сотрудников")]
+        logger.info("Создание объектов Task")
+        self.tasks = [Task(idx, row) for idx, (_, row) in enumerate(tqdm(task_df.iterrows(), total=len(task_df), desc="Создание задач"))]
+        logger.info(f"Успешно создано {len(self.employees)} сотрудников и {len(self.tasks)} задач")
+        add_diag('load', 'objects_built', reason=f"employees={len(self.employees)}, tasks={len(self.tasks)}")
+
+        self._check_post_data()
+
+    def _check_post_data(self):
+        """Пост-валидация объектов перед моделированием."""
+        # 1) shelf == unknown
+        unknown = [t for t in self.tasks if t.shelf == 'unknown']
+        for t in unknown:
+            add_diag('post_data', 'unknown_shelf', task_idx=t.idx, locationcode=t.locationcode,
+                     reason=f"shelf классифицирован как 'unknown'")
+            logger.warning(f"[post_data] Задача {t.idx} {t.locationcode}: shelf=unknown")
+
+        # 2) приоритет не в словаре (теоретически уже проверено)
+        for t in self.tasks:
+            if t.priority not in [f'priority_{i}' for i in range(1, 10)]:
+                add_diag('post_data', 'unknown_priority', task_idx=t.idx, locationcode=t.locationcode,
+                         reason=f"priority '{t.priority}' отсутствует в 1..9")
+                logger.warning(f"[post_data] Задача {t.idx} {t.locationcode}: priority={t.priority} !")
+
+        # 3) сотрудники без положительных скор для встречающихся полок
+        shelves_present = set(t.shelf for t in self.tasks)
+        for e in self.employees:
+            has_positive = any(e.scores.get(s, 0.0) > 0 for s in shelves_present)
+            if not has_positive:
+                add_diag('post_data', 'no_positive_scores', employee=e.login,
+                         reason=f"У сотрудника нет положительных score для полок {sorted(shelves_present)}")
+
+    def group_tasks(self):
+        logger.info("Группировка задач для multi_task")
+        self.task_groups.clear()
+        for task in tqdm(self.tasks, desc="Группировка задач"):
+            key = (task.locationcode, task.priority)
+            self.task_groups.setdefault(key, []).append(task)
+        logger.info(f"Создано {len(self.task_groups)} групп задач")
+        add_diag('group', 'groups_built', reason=f"groups={len(self.task_groups)}")
+
+    def adjust_work_times(self):
+        logger.info('[TRACE] adjust_work_times — старт')
+        logger.info("Регулировка времени работы сотрудников")
+        total_task_time = sum(task.time for task in self.tasks)
+        total_employee_time = sum(emp.work_time for emp in self.employees)
+        logger.info(f"Общее время задач: {total_task_time}, общее время сотрудников: {total_employee_time:.2f}")
+        add_diag('time', 'totals', reason=f"tasks_time={total_task_time}, employees_time={round(total_employee_time,2)}")
+
+        if total_task_time > total_employee_time + 1e-6:
+            increase_factor = min(1.05, total_task_time / total_employee_time)
+            for emp in self.employees:
+                emp.work_time = emp.work_time * increase_factor
+            new_total = sum(emp.work_time for emp in self.employees)
+            logger.info(f"Новое общее время сотрудников: {new_total:.2f} (увеличение на {(increase_factor-1)*100:.1f}%)")
+            add_diag('time', 'increased', reason=f"increase_factor={round(increase_factor,4)}, new_total={round(new_total,2)}")
+
+    def create_model(self) -> bool:
+        logger.info('[TRACE] create_model — старт')
+        try:
+            logger.info("Создание модели CP-SAT")
+            self.model = cp_model.CpModel()
+            self.x.clear()
+            self.y_line.clear()
+
+            # Переменные x[e,t] с подробным журналом фильтрации
+            logger.info("Создание булевых переменных назначений")
+            var_count = 0
+            zero_score_pairs = 0
+            for emp_idx, emp in enumerate(tqdm(self.employees, desc="Создание переменных")):
+                for task_idx, task in enumerate(self.tasks):
+                    ok, reason, extra = emp.can_assign_task(task.time, task.locationcode)
+                    if not ok:
+                        add_diag('create_vars', 'filter', employee=emp.login, task_idx=task_idx,
+                                 locationcode=task.locationcode, reason=reason, extra=extra)
+                        continue
+                    # Создаём переменную
+                    self.x[(emp_idx, task_idx)] = self.model.NewBoolVar(f'x[{emp_idx},{task_idx}]')
+                    var_count += 1
+                    # Диагностика нулевого score
+                    score = emp.get_score(task.shelf, task.priority)
+                    if score == 0.0:
+                        zero_score_pairs += 1
+                        add_diag('create_vars', 'zero_score', employee=emp.login, task_idx=task_idx,
+                                 locationcode=task.locationcode,
+                                 reason=f"score=0.0 для shelf={task.shelf}, priority={task.priority}")
+
+            logger.info(f"Создано {var_count} переменных x[e,t]; из них с нулевым score пар: {zero_score_pairs}")
+            add_diag('create_vars', 'summary', reason=f"x_vars={var_count}, zero_score_pairs={zero_score_pairs}")
+
+            # Диагностика задач без кандидатов
+            tasks_without_vars = [
+                task_idx for task_idx in range(len(self.tasks))
+                if not any((emp_idx, task_idx) in self.x for emp_idx in range(len(self.employees)))
+            ]
+            if tasks_without_vars:
+                logger.error(f"[DIAG] {len(tasks_without_vars)} задач не имеют кандидатов")
+                for ti in tasks_without_vars:
+                    t = self.tasks[ti]
+                    add_diag('no_candidates', 'no_candidate', task_idx=ti, locationcode=t.locationcode,
+                             reason=f"{t.shelf}, {t.priority}, time={t.time}")
+            else:
+                add_diag('no_candidates', 'ok', reason="Все задачи имеют хотя бы одного кандидата")
+
+            # Переменные y_line для stay_in_the_lineup
+            logger.info("Создание служебных переменных для stay_in_the_lineup")
+            lines = sorted({t.locationcode.split('-')[0] for t in self.tasks})
+            for emp_idx, emp in enumerate(self.employees):
+                if emp.stay_in_the_lineup:
+                    had_any = False
+                    for line in lines:
+                        any_vars = any((emp_idx, ti) in self.x and self.tasks[ti].locationcode.split('-')[0] == line
+                                       for ti in range(len(self.tasks)))
+                        if any_vars:
+                            had_any = True
+                            self.y_line[(emp_idx, line)] = self.model.NewBoolVar(f'y_line[{emp_idx},{line}]')
+                    if not had_any:
+                        add_diag('lineup', 'no_lines_for_employee', employee=emp.login,
+                                 reason="Нет допустимых линий для stay_in_the_lineup")
+
+            self._add_constraints()
+            self._set_objective()
+            logger.info("Модель успешно создана")
+            save_pre_solution_diagnostics()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка создания модели: {str(e)}", exc_info=True)
+            add_diag('model', 'build_error', reason=str(e))
+            return False
+
+    def _add_constraints(self):
+        logger.info("Добавление ограничений")
+
+        # 1) Каждая задача не более чем одному сотруднику
+        logger.info("Ограничение: каждая задача — не более чем одному сотруднику")
+        for task_idx in tqdm(range(len(self.tasks)), desc="Огр. по задачам"):
+            vars_for_task = [self.x[(emp_idx, task_idx)]
+                             for emp_idx in range(len(self.employees))
+                             if (emp_idx, task_idx) in self.x]
+            if vars_for_task:
+                self.model.AddAtMostOne(vars_for_task)
+
+        # 2) Ограничение по времени на сотрудника
+        logger.info("Ограничение: лимит времени сотрудников")
+        for emp_idx, emp in enumerate(tqdm(self.employees, desc="Огр. по времени")):
+            task_terms: List[cp_model.LinearExpr] = []
+            for task_idx, task in enumerate(self.tasks):
+                if (emp_idx, task_idx) in self.x:
+                    task_time_int = int(round(task.time))
+                    task_terms.append(self.x[(emp_idx, task_idx)] * task_time_int)
+            if task_terms:
+                limit = int(round(emp.work_time * (1.05 if emp.max_load else 1.0)))
+                if limit < 0:
+                    limit = 0
+                self.model.Add(sum(task_terms) <= limit)
+
+        # 3) Multi-task: в группе (locationcode, priority) один multi-task сотрудник берёт все задачи или ни одной
+        logger.info("Ограничение: multi_task группы")
+        for (loc, prio), tasks in tqdm(self.task_groups.items(), desc="Огр. multi_task"):
+            if len(tasks) <= 1:
+                continue
+            group_task_indices = [t.idx for t in tasks]
+            for emp_idx, emp in enumerate(self.employees):
+                if not emp.multi_task:
+                    continue
+                vars_in_group = [self.x[(emp_idx, ti)] for ti in group_task_indices if (emp_idx, ti) in self.x]
+                if len(vars_in_group) >= 2:
+                    first = vars_in_group[0]
+                    for v in vars_in_group[1:]:
+                        self.model.Add(v == first)
+                elif 0 < len(vars_in_group) < len(group_task_indices):
+                    missing = [ti for ti in group_task_indices if (emp_idx, ti) not in self.x]
+                    add_diag('multi_task', 'blocked_group', employee=emp.login, reason=f"{loc}/{prio}: нет x для части задач",
+                             extra={'missing_count': len(missing)})
+
+        # 4) Stay_in_the_lineup: сотрудник True работает не более чем по одной линии
+        logger.info("Ограничение: stay_in_the_lineup (не более одной линии)")
+        for emp_idx, emp in enumerate(tqdm(self.employees, desc="Огр. линейки")):
+            if not emp.stay_in_the_lineup:
+                continue
+            y_vars = []
+            for (e_idx, line), y_var in self.y_line.items():
+                if e_idx != emp_idx:
+                    continue
+                for task_idx, task in enumerate(self.tasks):
+                    if (emp_idx, task_idx) in self.x and task.locationcode.split('-')[0] == line:
+                        self.model.Add(self.x[(emp_idx, task_idx)] <= y_var)
+                y_vars.append(y_var)
+            if len(y_vars) >= 2:
+                self.model.AddAtMostOne(y_vars)
+            if not y_vars:
+                add_diag('lineup', 'no_lines_for_employee', employee=emp.login,
+                         reason="У сотрудника нет y_vars для stay_in_the_lineup")
+
+        logger.info(f"Всего ограничений в модели: {len(self.model.Proto().constraints)}")
+        add_diag('constraints', 'count', reason=f"{len(self.model.Proto().constraints)}")
+
+    def _set_objective(self):
+        logger.info("Установка целевой функции (max суммарный score)")
+        objective_terms: List[cp_model.LinearExpr] = []
+        for emp_idx, emp in enumerate(self.employees):
+            for task_idx, task in enumerate(self.tasks):
+                if (emp_idx, task_idx) in self.x:
+                    score = emp.get_score(task.shelf, task.priority)
+                    score_int = int(round(score * 1000))
+                    if score_int != 0:
+                        objective_terms.append(score_int * self.x[(emp_idx, task_idx)])
+        if objective_terms:
+            self.model.Maximize(sum(objective_terms))
+        else:
+            self.model.Maximize(0)
+        logger.info(f"Целевая функция: слагаемых {len(objective_terms)}")
+        add_diag('objective', 'terms', reason=f"{len(objective_terms)}")
+
+    def solve(self, time_limit: int = 300):
+        logger.info('[TRACE] solve — старт')
+        """Решение модели с heartbeat и детальной диагностикой."""
+        import threading
+
+        self.solver.parameters.log_search_progress = True
+        self.solver.parameters.num_search_workers = max(1, min(1, os.cpu_count() or 1))
+        if time_limit > 0:
+            self.solver.parameters.max_time_in_seconds = float(time_limit)
+
+        num_vars = len(self.model.Proto().variables)
+        num_constraints = len(self.model.Proto().constraints)
+        logger.info(f"[DIAG] Переменных в модели: {num_vars}")
+        logger.info(f"[DIAG] Ограничений в модели: {num_constraints}")
+        logger.info(f"[DIAG] Потоков поиска: {self.solver.parameters.num_search_workers}")
+        add_diag('solve', 'model_size', reason=f"vars={num_vars}, cts={num_constraints}, workers={self.solver.parameters.num_search_workers}")
+
+        if num_vars == 0:
+            logger.error("[DIAG] Модель не содержит переменных — решать нечего.")
+            add_diag('solve', 'no_vars', reason="Модель не содержит переменных")
+            return
+
+        logger.info("[DIAG] Примеры переменных:")
+        for i, var in enumerate(self.model.Proto().variables[:10]):
+            logger.info(f"   Var[{i}] name={var.name}, domain={var.domain}")
+
+        logger.info("[DIAG] Примеры ограничений:")
+        for i, ct in enumerate(self.model.Proto().constraints[:5]):
+            logger.info(f"   Constraint[{i}] тип={ct.WhichOneof('constraint')}")
+
+        stop_event = threading.Event()
+        def heartbeat():
+            start_time = time.time()
+            tick = 0
+            logger.info("[HB] Heartbeat запущен. Решение начинается...")
+            while not stop_event.wait(5):
+                tick += 1
+                elapsed = time.time() - start_time
+                logger.info(f"[HB] Решение продолжается... прошло {elapsed:.1f} сек (tick {tick})")
+                sys.stdout.flush()
+        threading.Thread(target=heartbeat, daemon=True).start()
+
+        start_time = time.time()
+        try:
+            status = self.solver.Solve(self.model)
+        except Exception as e:
+            stop_event.set()
+            add_diag('solve', 'exception', reason=str(e))
+            logger.exception(f"[DIAG] Исключение во время решения: {e}")
+            return
+        stop_event.set()
+        elapsed = time.time() - start_time
+
+        logger.info(f"[DIAG] Статус после решения: {self.solver.StatusName(status)}")
+        logger.info(f"[DIAG] Время решения: {elapsed:.3f} сек")
+        logger.info(f"[DIAG] Ветки поиска: {self.solver.NumBranches()}")
+        logger.info(f"[DIAG] Конфликты: {self.solver.NumConflicts()}")
+        add_diag('solve', 'status', reason=self.solver.StatusName(status), extra={
+            'time_sec': round(elapsed, 3),
+            'branches': self.solver.NumBranches(),
+            'conflicts': self.solver.NumConflicts()
+        })
+
+        if status == cp_model.INFEASIBLE:
+            logger.error("[DIAG] Модель противоречива (INFEASIBLE) — решений нет.")
+            add_diag('solve', 'infeasible', reason="INFEASIBLE")
+            # Сохраняем модель
+            try:
+                with open("debug_model.lp", "w", encoding="utf-8") as f:
+                    f.write(str(self.model))
+                add_diag('solve', 'dump_lp', reason="debug_model.lp сохранён")
+            except Exception as e:
+                add_diag('solve', 'dump_lp_error', reason=str(e))
+            try:
+                with open("debug_model.txt", "w", encoding="utf-8") as f:
+                    f.write(repr(self.model))
+                add_diag('solve', 'dump_proto', reason="debug_model.txt сохранён")
+            except Exception as e:
+                add_diag('solve', 'dump_proto_error', reason=str(e))
+            # Список последних ограничений
+            total_ct = len(self.model.Proto().constraints)
+            logger.info(f"[DIAG] Последние 20 ограничений из {total_ct}:")
+            for i, ct in enumerate(self.model.Proto().constraints[-20:], start=max(0, total_ct-20)):
+                logger.info(f"   Constraint[{i}] тип={ct.WhichOneof('constraint')}")
+            return
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            self._process_solution()
+            logger.info(f"[DIAG] Найдено решение со значением цели: {self.solver.ObjectiveValue()}")
+            add_diag('solve', 'objective', reason=f"{self.solver.ObjectiveValue()}")
+            # Диагностика неназначенных задач
+            for t in self.tasks:
+                assigned = (t.assigned_to is not None)
+                if not assigned:
+                    cand_cnt = sum(1 for emp_idx in range(len(self.employees)) if (emp_idx, t.idx) in self.x)
+                    add_diag('solve_results', 'unassigned', task_idx=t.idx, locationcode=t.locationcode,
+                             reason=f"Не назначена (кандидатов={cand_cnt})",
+                             extra={'shelf': t.shelf, 'priority': t.priority, 'time': t.time})
+        else:
+            logger.warning(f"[DIAG] Решение не найдено, статус: {self.solver.StatusName(status)}")
+            add_diag('solve', 'no_solution', reason=self.solver.StatusName(status))
+
+    def _process_solution(self):
+        try:
+            logger.info("Обработка решения")
+            self.total_score = self.solver.ObjectiveValue() / 1000.0
+            assigned_count = 0
+            for emp_idx, emp in enumerate(self.employees):
+                for task_idx, task in enumerate(self.tasks):
+                    if (emp_idx, task_idx) in self.x and self.solver.Value(self.x[(emp_idx, task_idx)]) == 1:
+                        task.assigned_to = emp.login
+                        emp.assign_task(task.time, task.locationcode)
+                        self.assignment[task.idx] = emp.login
+                        assigned_count += 1
+            logger.info(f"Назначено {assigned_count} задач из {len(self.tasks)}")
+            add_diag('process', 'assigned_count', reason=f"{assigned_count}/{len(self.tasks)} назначено")
+        except Exception as e:
+            logger.error(f"Ошибка обработки решения: {str(e)}", exc_info=True)
+            add_diag('process', 'error', reason=str(e))
+            raise
+
+    def save_results(self, output_file: str = 'output_assignment.xlsx'):
+        logger.info('[TRACE] save_results — старт')
+        try:
+            logger.info(f"Сохранение результатов в {output_file}")
+
+            result_rows = []
+            for task in self.tasks:
+                task_score = 0.0
+                if task.assigned_to is not None:
+                    emp = next((e for e in self.employees if e.login == task.assigned_to), None)
+                    if emp is not None:
+                        task_score = emp.get_score(task.shelf, task.priority)
+                result_rows.append({
+                    'priority': task.priority,
+                    'time': task.time,
+                    'locationcode': task.locationcode,
+                    'shelf': task.shelf,
+                    'login': task.assigned_to if task.assigned_to is not None else '',
+                    'score': round(task_score, 6)
+                })
+            task_df_out = pd.DataFrame(result_rows)
+
+            summary_df = pd.DataFrame([{
+                'total_score': round(self.total_score, 3),
+                'assigned_tasks': int(sum(1 for t in self.tasks if t.assigned_to is not None)),
+                'total_tasks': int(len(self.tasks)),
+                'assignment_rate': float(sum(1 for t in self.tasks if t.assigned_to is not None)) / float(len(self.tasks)) if self.tasks else 0.0,
+                'employees_used': int(len({t.assigned_to for t in self.tasks if t.assigned_to is not None})),
+                'total_employees': int(len(self.employees))
+            }])
+
+            diagnostics_df = pd.DataFrame(DIAGNOSTICS)
+
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                task_df_out.to_excel(writer, sheet_name='task', index=False)
+                summary_df.to_excel(writer, sheet_name='summary', index=False)
+                diagnostics_df.to_excel(writer, sheet_name='diagnostics', index=False)
+
+            logger.info("Результаты успешно сохранены.")
+            add_diag('save', 'ok', reason=f"Файл сохранён: {output_file}")
+
+            self._log_additional_stats()
+        except Exception as e:
+            logger.error(f"Ошибка сохранения результатов: {str(e)}", exc_info=True)
+            add_diag('save', 'error', reason=str(e))
+            raise
+
+    def _log_additional_stats(self):
+        logger.info("\nДополнительная статистика:")
+        shelf_stats: Dict[str, int] = {}
+        for task in self.tasks:
+            if task.assigned_to:
+                shelf_stats[task.shelf] = shelf_stats.get(task.shelf, 0) + 1
+        logger.info("Распределение назначенных задач по типам:")
+        for shelf, count in shelf_stats.items():
+            logger.info(f"  {shelf}: {count} задач")
+        logger.info("\nЗагрузка сотрудников:")
+        for emp in sorted(self.employees, key=lambda x: x.used_time, reverse=True)[:10]:
+            usage = emp.used_time / float(emp.work_time) * 100.0 if emp.work_time > 0 else 0.0
+            logger.info(
+                f"  {emp.login}: {len(emp.assigned_tasks)} задач, "
+                f"{emp.used_time:.1f}/{emp.work_time:.1f} мин ({usage:.1f}%)"
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    try:
+        logger.info("="*80)
+        logger.info("ЗАПУСК ПРОГРАММЫ РАСПРЕДЕЛЕНИЯ ЗАДАЧ (CP-SAT OR-Tools) — ДИАГНОСТИКА")
+        logger.info("="*80)
+
+        start_time = time.time()
+
+        # 0) Валидация
+        input_file = 'input_matrix.xlsx'
+        validator = DataValidator(input_file)
+        valid = validator.validate_file()
+        if not valid:
+            logger.error("Валидация не пройдена. Программа завершена.")
+            return
+
+        # 1) Инициализация
+        logger.info("\n1. ИНИЦИАЛИЗАЦИЯ")
+        assigner = TaskAssigner(input_file)
+        if not assigner.employees or not assigner.tasks:
+            logger.error("Нет данных для обработки! Программа завершена.")
+            add_diag('main', 'no_data', reason="Нет сотрудников или задач после загрузки")
+            return
+
+        # 2) Регулировка времени
+        logger.info("\n2. РЕГУЛИРОВКА ВРЕМЕНИ")
+        assigner.adjust_work_times()
+
+        # 3) Создание модели
+        logger.info("\n3. СОЗДАНИЕ МОДЕЛИ")
+        if not assigner.create_model():
+            logger.error("Не удалось создать модель оптимизации! Программа завершена.")
+            return
+
+        # 4) Решение модели
+        logger.info("\n4. РЕШЕНИЕ МОДЕЛИ")
+        assigner.solve(time_limit=300)
+
+        # 5) Сохранение результатов
+        logger.info("\n5. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ")
+        assigner.save_results('output_assignment.xlsx')
+
+        total_time = time.time() - start_time
+        logger.info("\nЗАВЕРШЕНИЕ ПРОГРАММЫ")
+        logger.info(f"Общее время выполнения: {total_time:.2f} секунд")
+        add_diag('main', 'done', reason=f"Total time {round(total_time,2)} sec")
+        logger.info("="*80)
+    except Exception as e:
+        logger.error("\nКРИТИЧЕСКАЯ ОШИБКА", exc_info=True)
+        add_diag('main', 'critical', reason=str(e))
+        logger.info("="*80)
+        raise
+
+
+if __name__ == '__main__':
+    main()
